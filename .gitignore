@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# 모델 파일 (다운로드 URL은 face_analyzer.py / pose_analyzer.py 참고)
+#   face_landmarker.task   from storage.googleapis.com/mediapipe-models/face_landmarker/...
+#   pose_landmarker_lite.task from storage.googleapis.com/mediapipe-models/pose_landmarker/...
+backend/models/*.task
+
+# 사용자별/세션별 데이터
+calibration.npz
+snapshots/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# 로그
+*.log
