@@ -26,3 +26,4 @@ snapshots/
 
 # 로그
 *.log
+.pem
