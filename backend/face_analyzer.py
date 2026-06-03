@@ -14,9 +14,10 @@ mediapipe 0.10.x부터 legacy Solutions API가 제거돼 Tasks API만 남았다.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -36,6 +37,8 @@ LM_CHEEK_LEFT  = 50        # 화면상 좌측 뺨
 LM_CHEEK_RIGHT = 280       # 화면상 우측 뺨
 LM_LEFT_BROW   = 105
 LM_RIGHT_BROW  = 334
+LM_LEFT_EYE_OUTER  = 33    # 화면상 좌측 눈 바깥
+LM_RIGHT_EYE_OUTER = 263   # 화면상 우측 눈 바깥
 
 
 @dataclass
@@ -62,6 +65,12 @@ class FaceRegions:
     forehead_box: BBox
     cheek_left_box: BBox
     cheek_right_box: BBox
+    # 얼굴 roll에 맞춰 회전된 외접 사각형의 4 corner (좌상→우상→우하→좌하)
+    quad: List[Point] = field(default_factory=list)
+    forehead_quad: List[Point] = field(default_factory=list)
+    cheek_left_quad: List[Point] = field(default_factory=list)
+    cheek_right_quad: List[Point] = field(default_factory=list)
+    roll_deg: float = 0.0
 
 
 @dataclass
@@ -71,9 +80,19 @@ class FaceResult:
 
 
 class FaceAnalyzer:
-    def __init__(self, rgb_source, fps: float = 15.0) -> None:
+    def __init__(
+        self,
+        rgb_source,
+        fps: float = 15.0,
+        detection_confidence: float = 0.5,
+        presence_confidence: float = 0.5,
+        tracking_confidence: float = 0.5,
+    ) -> None:
         self.rgb_source = rgb_source
         self.interval = 1.0 / max(fps, 1.0)
+        self.detection_confidence = detection_confidence
+        self.presence_confidence = presence_confidence
+        self.tracking_confidence = tracking_confidence
         self._latest: Optional[FaceResult] = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -86,10 +105,10 @@ class FaceAnalyzer:
         options = mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(MODEL_PATH)),
             running_mode=mp_vision.RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            num_faces=4,
+            min_face_detection_confidence=self.detection_confidence,
+            min_face_presence_confidence=self.presence_confidence,
+            min_tracking_confidence=self.tracking_confidence,
         )
         self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -159,6 +178,42 @@ class FaceAnalyzer:
             y1 = int(min(1.0, max(ys)) * h)
             bbox = BBox(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
+            # roll(고개 기울임)에 맞춘 회전된 외접 사각형 4 corner.
+            # 두 눈 바깥 점으로 roll 각도를 측정 → landmarks를 역회전 후
+            # AABB → 다시 정회전. minAreaRect보다 frame 간 코너 순서가 안정적.
+            pts = np.empty((len(landmarks), 2), dtype=np.float32)
+            for i, lm in enumerate(landmarks):
+                pts[i, 0] = lm.x * w
+                pts[i, 1] = lm.y * h
+            le = landmarks[LM_LEFT_EYE_OUTER]
+            re = landmarks[LM_RIGHT_EYE_OUTER]
+            roll = math.atan2((re.y - le.y) * h, (re.x - le.x) * w)
+            cx = float(pts[:, 0].mean())
+            cy = float(pts[:, 1].mean())
+            cos_a = math.cos(-roll)
+            sin_a = math.sin(-roll)
+            R_inv = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+            shifted = pts - np.array([cx, cy], dtype=np.float32)
+            rotated = shifted @ R_inv.T
+            rx0, ry0 = rotated.min(axis=0)
+            rx1, ry1 = rotated.max(axis=0)
+            corners_rot = np.array(
+                [[rx0, ry0], [rx1, ry0], [rx1, ry1], [rx0, ry1]],
+                dtype=np.float32,
+            )
+            cos_b = math.cos(roll)
+            sin_b = math.sin(roll)
+            R = np.array([[cos_b, -sin_b], [sin_b, cos_b]], dtype=np.float32)
+            corners = corners_rot @ R.T + np.array([cx, cy], dtype=np.float32)
+            quad = [
+                Point(
+                    int(round(float(np.clip(c[0], 0, w - 1)))),
+                    int(round(float(np.clip(c[1], 0, h - 1)))),
+                )
+                for c in corners
+            ]
+            roll_deg = math.degrees(roll)
+
             def pt(idx: int) -> Point:
                 lm = landmarks[idx]
                 return Point(int(lm.x * w), int(lm.y * h))
@@ -191,6 +246,31 @@ class FaceAnalyzer:
                 cheek_size,
             )
 
+            # 각 영역 박스를 face roll 각도로 회전시킨 4-corner quad.
+            # 좌상→우상→우하→좌하 순서.
+            cos_r = math.cos(roll)
+            sin_r = math.sin(roll)
+            R_face = np.array([[cos_r, -sin_r], [sin_r, cos_r]], dtype=np.float32)
+
+            def rotated_quad(cx_f: float, cy_f: float, bw: int, bh: int) -> List[Point]:
+                hw, hh = bw / 2.0, bh / 2.0
+                base = np.array(
+                    [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]],
+                    dtype=np.float32,
+                )
+                rot = base @ R_face.T + np.array([cx_f, cy_f], dtype=np.float32)
+                return [
+                    Point(
+                        int(round(float(np.clip(p[0], 0, w - 1)))),
+                        int(round(float(np.clip(p[1], 0, h - 1)))),
+                    )
+                    for p in rot
+                ]
+
+            forehead_quad = rotated_quad(f_x + f_w / 2.0, top_y + f_h / 2.0, f_w, f_h)
+            cheek_l_quad = rotated_quad(cheek_l.x, cheek_l.y, cheek_size, cheek_size)
+            cheek_r_quad = rotated_quad(cheek_r.x, cheek_r.y, cheek_size, cheek_size)
+
             out.append(FaceRegions(
                 bbox=bbox,
                 nose_tip=nose,
@@ -200,5 +280,10 @@ class FaceAnalyzer:
                 forehead_box=forehead_box,
                 cheek_left_box=cheek_l_box,
                 cheek_right_box=cheek_r_box,
+                quad=quad,
+                forehead_quad=forehead_quad,
+                cheek_left_quad=cheek_l_quad,
+                cheek_right_quad=cheek_r_quad,
+                roll_deg=roll_deg,
             ))
         return out

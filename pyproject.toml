@@ -10,6 +10,7 @@ dependencies = [
     "opencv-python>=4.10",
     "pyserial>=3.5",
     "mediapipe>=0.10.35",
+    "httpx>=0.28.1",
 ]
 
 [tool.uv]

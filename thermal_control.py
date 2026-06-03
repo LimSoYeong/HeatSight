@@ -39,6 +39,14 @@ T_MINMAX_DATA_ADDR = 0x2D000054   # min/max raw 값 (LE: min[0:2], max[2:4])
 T_MIN_COORD_ADDR   = 0x2D000058   # min 좌표 (LE: Y[0:2], X[2:4])
 T_MAX_COORD_ADDR   = 0x2D00005C   # max 좌표 (LE: Y[0:2], X[2:4])
 
+# Radiometric 변환용 — °C 계산에 필요
+T_BOARDTEMP_ADDR              = 0x00001000   # 1 byte signed int8 — board temp C
+T_RADIOMETRIC_GAIN0_ADDR      = 0x00002028   # 1 byte (low)
+T_RADIOMETRIC_GAIN1_ADDR      = 0x00002029   # 1 byte (high)
+T_PWM_TARGET_ADDR             = 0x0000207D   # 1 byte
+T_RADIOMETRIC_PARAMETER_BASE  = 0x60EEA004   # 5개 float32, +0x04씩
+RADIOMETRY_GAIN_SHIFT         = 16384.0      # kRadiometryGainShift
+
 # 프로토콜 상수 (SerialWorker.h)
 _CMD_READ_HEADER  = bytes([0x00, 0x40, 0x00, 0x08, 0x0C, 0x00])
 _CMD_WRITE_HEADER = bytes([0x00, 0x40, 0x02, 0x08])
@@ -185,6 +193,69 @@ class CellplusControl:
             import time
             time.sleep(settle_s)
         return self.get_temperature_pixel_raw()
+
+    def measure_bbox_mean_raw(
+        self,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        grid: int = 4,
+        settle_s: float = 0.015,
+    ) -> tuple[int, list[int]]:
+        """bbox 내 grid×grid 균일 샘플의 평균 raw + 샘플 리스트.
+
+        ROI는 화면(display) 좌표계. bbox는 화면 범위 안에서 클립된다.
+        grid=4면 16점 × ~15ms = ~240ms/face. 정확도/속도 트레이드오프 지점.
+        """
+        x0 = max(0, int(x))
+        y0 = max(0, int(y))
+        x1 = min(IMAGE_WIDTH, int(x + w))
+        y1 = min(IMAGE_HEIGHT, int(y + h))
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError(f"빈 bbox: ({x},{y},{w},{h})")
+        bw = x1 - x0
+        bh = y1 - y0
+        samples: list[int] = []
+        for j in range(grid):
+            py = y0 + int((j + 0.5) * bh / grid)
+            py = min(IMAGE_HEIGHT - 1, max(0, py))
+            for i in range(grid):
+                px = x0 + int((i + 0.5) * bw / grid)
+                px = min(IMAGE_WIDTH - 1, max(0, px))
+                samples.append(self.measure_pixel_raw(px, py, settle_s=settle_s))
+        mean_raw = int(round(sum(samples) / len(samples)))
+        return mean_raw, samples
+
+    def get_radiometric_static_params(self) -> list[float]:
+        """5개의 정적 radiometric 파라미터 (startup 1회).
+
+        Tech Reference: 각 register 4 byte 응답 body에서 float32 1개 추출.
+        """
+        import struct
+        out: list[float] = []
+        for i in range(5):
+            addr = T_RADIOMETRIC_PARAMETER_BASE + i * 4
+            data = self.read_mem(addr, 4)
+            (val,) = struct.unpack("<f", data[:4])
+            out.append(val)
+        return out
+
+    def get_temperature_dynamic_params(self) -> dict:
+        """동적 파라미터 (매 측정 query): boardTempC, radiometricGain, pwmTarget."""
+        import struct
+        board_raw = self.read_mem(T_BOARDTEMP_ADDR, 1)
+        (board_c,) = struct.unpack("b", board_raw[:1])  # signed int8
+        g0 = self.read_mem(T_RADIOMETRIC_GAIN0_ADDR, 1)[0]
+        g1 = self.read_mem(T_RADIOMETRIC_GAIN1_ADDR, 1)[0]
+        gain_u16 = (g1 << 8) | g0
+        gain = gain_u16 / RADIOMETRY_GAIN_SHIFT
+        pwm = self.read_mem(T_PWM_TARGET_ADDR, 1)[0]
+        return {
+            "board_temp_c": float(board_c),
+            "gain": gain,
+            "pwm_target": float(pwm),
+        }
 
     def get_minmax(self) -> dict:
         """프레임 전체 min/max raw 값과 좌표를 화면 좌표계로 반환."""
