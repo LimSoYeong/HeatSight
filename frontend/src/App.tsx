@@ -100,9 +100,22 @@ interface Status {
   cellplus_connected: boolean
   face_connected: boolean
   face_thermal_connected: boolean
+  thermal_persons_connected: boolean
   pose_connected: boolean
   colormap_idx: number
   colormap_presets: number[]
+}
+
+interface ThermalPerson {
+  id: number
+  bbox: BBox
+  head: BBox
+  area: number
+}
+
+interface ThermalPersonData {
+  timestamp: number
+  people: ThermalPerson[]
 }
 
 interface HvacRecommendation {
@@ -185,6 +198,7 @@ export default function App() {
   const [probe, setProbe] = useState<Probe | null>(null)
   const [face, setFace] = useState<FaceData | null>(null)
   const [faceThermal, setFaceThermal] = useState<FaceData | null>(null)
+  const [thermalPersons, setThermalPersons] = useState<ThermalPersonData | null>(null)
   const [faceTemps, setFaceTemps] = useState<FaceTempData | null>(null)
   const [pose, setPose] = useState<PoseData | null>(null)
   const [behavior, setBehavior] = useState<BehaviorData | null>(null)
@@ -262,6 +276,23 @@ export default function App() {
       clearInterval(t)
     }
   }, [status?.face_thermal_connected])
+
+  useEffect(() => {
+    if (!status?.thermal_persons_connected) return
+    let stopped = false
+    async function poll() {
+      try {
+        const r = await fetch('/api/thermal/persons')
+        if (r.ok && !stopped) setThermalPersons(await r.json())
+      } catch {}
+    }
+    poll()
+    const t = setInterval(poll, 300)
+    return () => {
+      stopped = true
+      clearInterval(t)
+    }
+  }, [status?.thermal_persons_connected])
 
   useEffect(() => {
     if (!status?.face_connected || !status?.cellplus_connected || !cal?.homography_ready) return
@@ -489,7 +520,7 @@ export default function App() {
           src="/api/video/rgb"
           faces={face?.faces ?? []}
           faceTemps={faceTemps?.faces ?? []}
-          pose={pose?.poses[0] ?? null}
+          poses={pose?.poses ?? []}
           calPairs={cal?.pairs ?? []}
           calMode={calMode}
           calPending={calPending}
@@ -500,6 +531,11 @@ export default function App() {
           minmax={minmax}
           probe={probe}
           thermalFaces={faceThermal?.faces ?? []}
+          thermalPersons={thermalPersons?.people ?? []}
+          rgbPeopleCount={Math.max(
+            face?.faces.length ?? 0,
+            pose?.poses.length ?? 0,
+          )}
           faceTemps={faceTemps?.faces ?? []}
           calPairs={cal?.pairs ?? []}
           calMode={calMode}
@@ -601,7 +637,7 @@ function RGBPanel({
   src,
   faces,
   faceTemps,
-  pose,
+  poses,
   calPairs,
   calMode,
   calPending,
@@ -610,7 +646,7 @@ function RGBPanel({
   src: string
   faces: FaceRegions[]
   faceTemps: FaceTemp[]
-  pose: PoseRegions | null
+  poses: PoseRegions[]
   calPairs: CalPair[]
   calMode: boolean
   calPending: { x: number; y: number } | null
@@ -628,7 +664,7 @@ function RGBPanel({
 
   const tags: string[] = []
   if (faces.length > 0) tags.push(`${faces.length} face${faces.length > 1 ? 's' : ''}`)
-  if (pose) tags.push('pose')
+  if (poses.length > 0) tags.push(`${poses.length} pose${poses.length > 1 ? 's' : ''}`)
   const subtitle = calMode
     ? 'click to add a calibration point'
     : `MacBook FaceTime HD  ·  ${tags.length ? tags.join(' + ') : 'detecting…'}`
@@ -648,7 +684,8 @@ function RGBPanel({
           viewBox={`0 0 ${RGB_W} ${RGB_H}`}
           preserveAspectRatio="xMidYMid meet"
         >
-          {!calMode && pose && <PoseOverlay pose={pose} />}
+          {!calMode &&
+            poses.map((p, i) => <PoseOverlay key={`pose${i}`} pose={p} />)}
           {!calMode &&
             faces.map((f, i) => (
               <FaceOverlay
@@ -1018,6 +1055,53 @@ function FaceOverlay({
   )
 }
 
+function ThermalPersonOverlay({ person }: { person: ThermalPerson }) {
+  const { bbox, head, id } = person
+  return (
+    <g>
+      {/* person body bbox — 흐릿하게 */}
+      <rect
+        x={bbox.x}
+        y={bbox.y}
+        width={bbox.w}
+        height={bbox.h}
+        fill="none"
+        stroke="#3fb950"
+        strokeWidth={1.2}
+        strokeDasharray="4 3"
+        opacity={0.7}
+      />
+      {/* head bbox — 강조 */}
+      <rect
+        x={head.x}
+        y={head.y}
+        width={head.w}
+        height={head.h}
+        fill="none"
+        stroke="#3fb950"
+        strokeWidth={2}
+      />
+      <rect
+        x={head.x}
+        y={Math.max(0, head.y - 18)}
+        width={56}
+        height={16}
+        fill="rgba(0, 0, 0, 0.65)"
+        rx={3}
+      />
+      <text
+        x={head.x + 6}
+        y={Math.max(12, head.y - 5)}
+        fill="#3fb950"
+        fontSize={12}
+        fontWeight={700}
+      >
+        person #{id}
+      </text>
+    </g>
+  )
+}
+
 function RegionBox({ box, color, label }: { box: BBox; color: string; label: string }) {
   return (
     <g>
@@ -1086,6 +1170,14 @@ function transformQuad(quad: Pt[] | undefined, H: number[][] | null): Pt[] | nul
   return quad.map((p) => applyH(H, p))
 }
 
+function boxesOverlap(a: BBox, b: BBox): boolean {
+  const ax2 = a.x + a.w
+  const ay2 = a.y + a.h
+  const bx2 = b.x + b.w
+  const by2 = b.y + b.h
+  return a.x < bx2 && ax2 > b.x && a.y < by2 && ay2 > b.y
+}
+
 function bboxToQuad(b: BBox): Pt[] {
   return [
     { x: b.x, y: b.y },
@@ -1104,6 +1196,8 @@ function ThermalPanel({
   minmax,
   probe,
   thermalFaces,
+  thermalPersons,
+  rgbPeopleCount,
   faceTemps,
   calPairs,
   calMode,
@@ -1116,6 +1210,8 @@ function ThermalPanel({
   minmax: MinMax | null
   probe: Probe | null
   thermalFaces: FaceRegions[]
+  thermalPersons: ThermalPerson[]
+  rgbPeopleCount: number
   faceTemps: FaceTemp[]
   calPairs: CalPair[]
   calMode: boolean
@@ -1172,12 +1268,31 @@ function ThermalPanel({
             <Marker x={probe.x} y={probe.y} color="#e6edf3"
                     label={fmtCelsius(probe.celsius) ?? `raw ${probe.raw}`} />
           )}
-          {!calMode &&
-            thermalFaces.map((f, i) => {
-              const celsius =
-                faceTemps.find((t) => t.index === i)?.mean_celsius ?? null
-              return <FaceOverlay key={i} face={f} celsius={celsius} />
-            })}
+          {/* RGB 사람 수를 ground truth로 사용. thermal에서도 그 수만큼만 표시.
+              face 잡힌 사람 우선, 남은 slot은 area 큰 person 박스로 채움. */}
+          {!calMode && (() => {
+            const limit = Math.max(rgbPeopleCount, thermalFaces.length)
+            const faceSlots = Math.min(thermalFaces.length, limit)
+            const visibleFaces = thermalFaces.slice(0, faceSlots)
+            const remainSlots = Math.max(0, limit - visibleFaces.length)
+            const personsSorted = thermalPersons
+              .filter((p) => !visibleFaces.some((f) => boxesOverlap(f.bbox, p.head)))
+              .slice()
+              .sort((a, b) => b.area - a.area)
+              .slice(0, remainSlots)
+            return (
+              <>
+                {visibleFaces.map((f, i) => {
+                  const celsius =
+                    faceTemps.find((t) => t.index === i)?.mean_celsius ?? null
+                  return <FaceOverlay key={`f${i}`} face={f} celsius={celsius} />
+                })}
+                {personsSorted.map((p) => (
+                  <ThermalPersonOverlay key={`p${p.id}`} person={p} />
+                ))}
+              </>
+            )
+          })()}
           {calPairs.map((p, i) => (
             <CalMarker key={i} x={p.thermal.x} y={p.thermal.y} index={i + 1} />
           ))}

@@ -43,6 +43,7 @@ from thermal_control import (
     find_control_port,
 )
 from face_analyzer import FaceAnalyzer
+from thermal_person_analyzer import ThermalPersonAnalyzer
 from pose_analyzer import PoseAnalyzer  # legacy (사용 안 함, 호환용)
 from remote_pose_analyzer import RemotePoseAnalyzer
 from behavior_analyzer import BehaviorAnalyzer
@@ -69,6 +70,7 @@ class CameraHub:
         self.cellplus: Optional[CellplusControl] = None
         self.face: Optional[FaceAnalyzer] = None
         self.face_thermal: Optional[FaceAnalyzer] = None
+        self.thermal_persons: Optional[ThermalPersonAnalyzer] = None
         self.pose: Optional[RemotePoseAnalyzer] = None
         self.behavior: Optional[BehaviorAnalyzer] = None
         self.colormap_idx: int = COLORMAP_PRESETS[0]
@@ -79,8 +81,15 @@ class CameraHub:
         self.thermal = ThermalSource().start()
 
         try:
-            self.face = FaceAnalyzer(self.rgb, fps=15.0).start()
-            print("[hub] FaceAnalyzer (RGB) 시작")
+            # 멀리 있는 얼굴도 잡기 위해 detection confidence를 낮춤.
+            self.face = FaceAnalyzer(
+                self.rgb,
+                fps=15.0,
+                detection_confidence=0.3,
+                presence_confidence=0.3,
+                tracking_confidence=0.3,
+            ).start()
+            print("[hub] FaceAnalyzer (RGB) 시작 (low threshold)")
         except Exception as e:
             print(f"[hub] FaceAnalyzer (RGB) 시작 실패: {e}")
 
@@ -97,6 +106,15 @@ class CameraHub:
             print("[hub] FaceAnalyzer (Thermal) 시작 (low threshold)")
         except Exception as e:
             print(f"[hub] FaceAnalyzer (Thermal) 시작 실패: {e}")
+
+        # Thermal multi-person: MediaPipe가 thermal에서 잘 못 잡으므로 hotspot 기반.
+        try:
+            self.thermal_persons = ThermalPersonAnalyzer(
+                self.thermal, fps=5.0,
+            ).start()
+            print("[hub] ThermalPersonAnalyzer 시작")
+        except Exception as e:
+            print(f"[hub] ThermalPersonAnalyzer 시작 실패: {e}")
 
         try:
             self.pose = RemotePoseAnalyzer(
@@ -139,6 +157,8 @@ class CameraHub:
             self.face.stop()
         if self.face_thermal is not None:
             self.face_thermal.stop()
+        if self.thermal_persons is not None:
+            self.thermal_persons.stop()
         if self.rgb is not None:
             self.rgb.stop()
         if self.thermal is not None:
@@ -461,6 +481,7 @@ def get_status() -> dict:
         "cellplus_connected": hub.cellplus is not None,
         "face_connected": hub.face is not None,
         "face_thermal_connected": hub.face_thermal is not None,
+        "thermal_persons_connected": hub.thermal_persons is not None,
         "pose_connected": hub.pose is not None,
         "colormap_idx": hub.colormap_idx,
         "colormap_presets": COLORMAP_PRESETS,
@@ -479,6 +500,13 @@ def get_face_thermal() -> dict:
     if hub.face_thermal is None:
         raise HTTPException(status_code=503, detail="Thermal FaceAnalyzer 비활성")
     return hub.face_thermal.latest()
+
+
+@app.get("/api/thermal/persons")
+def get_thermal_persons() -> dict:
+    if hub.thermal_persons is None:
+        raise HTTPException(status_code=503, detail="ThermalPersonAnalyzer 비활성")
+    return hub.thermal_persons.latest()
 
 
 @app.get("/api/pose")
