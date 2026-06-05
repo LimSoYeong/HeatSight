@@ -68,6 +68,38 @@ HVAC 제어
 
 ---
 
+## 현재 구현 상태 (2026-06 기준)
+
+기획에서 시작해 실제로 동작하는 듀얼 카메라 + 원격 GPU 추론 파이프라인까지 구현됐다. 구성은 **로컬 백엔드(MacBook)** 와 **원격 GPU 서비스** 두 축으로 나뉜다.
+
+### 로컬 백엔드 — FastAPI (`backend/`)
+실시간 캡처·정합·추론 오케스트레이션을 담당한다.
+
+| 모듈 | 역할 |
+|---|---|
+| `calibration.py` | RGB ↔ Thermal **호모그래피** 캘리브레이션 (수동 대응점 클릭) |
+| `face_analyzer.py` | RGB 얼굴 분석 — MediaPipe FaceLandmarker (RGB·Thermal 양쪽 적용) |
+| `thermal_person_analyzer.py` | 열화상 **다중 인물** 검출 — hotspot 기반 머리 박스 + IoU/centroid 2-stage 트래킹 (MediaPipe가 열화상에서 약한 점 보완) |
+| `remote_pose_analyzer.py` | 원격 GPU의 RTMPose 호출로 자세 추정 |
+| `behavior_analyzer.py` | 휴리스틱 행동 신호 → 쾌적도 점수 |
+| `server.py` | HVAC 추천 엔드포인트 — `comfort_score = 0.7·피부온도 + 0.3·행동` 으로 종합해 제어안 산출 |
+
+프런트엔드(`frontend/`, React+Vite)는 RGB·열화상 영상에 얼굴/자세/인물 박스를 오버레이하고, **RGB 사람 수를 ground truth로 삼아** 열화상 표시 인원을 제한한다.
+
+### 원격 GPU 서비스 (`gpu_service/`)
+무거운 추론을 분리한 별도 서비스.
+
+| 모듈 | 역할 |
+|---|---|
+| `temperature.py` | raw 열화상 → **°C 변환** (`libtemperature_calculator.so` ctypes 래핑) |
+| `pose_runtime.py` | RTMPose-L 자세 추정 |
+| `clip_runtime.py` | SigLIP **zero-shot** 텍스트-이미지 매칭 (옷차림 등 추정) |
+| `vlm_runtime.py` | Qwen2-VL-2B — **자연어 추론**으로 더위/추위 판단 |
+
+→ 기획의 "옷차림·활동량·행동 신호" 추정을, 휴리스틱뿐 아니라 **CLIP zero-shot + VLM**으로 끌어올린 형태.
+
+---
+
 ## 가장 어려운 기술적 난관
 
 ### 1. 캘리브레이션/정합 (1순위 난관)
@@ -132,3 +164,12 @@ RGB와 열화상은 해상도·화각·렌즈 왜곡이 다르다. 두 영상을
 5. **사용자 피드백 버튼**으로 보정
 
 이 정도로 시작해서 **다인 → 개인화 → HVAC 연동**으로 확장하는 게 현실적이다.
+
+### 진척 (2026-06)
+- ✅ 듀얼 카메라 캡처 + 호모그래피 정합
+- ✅ 얼굴 검출 및 얼굴 영역 온도(°C) 추출
+- ✅ **다인 감지** — 열화상 multi-person 트래킹까지 진입
+- ✅ 행동/옷차림 추정 — 휴리스틱 + CLIP/VLM
+- ✅ 피부온도+행동 종합 HVAC 추천 로직
+- ⬜ 사용자 피드백 루프 기반 개인화 학습
+- ⬜ 실제 HVAC 장비 연동
