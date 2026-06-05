@@ -1,0 +1,31 @@
+[project]
+name = "heatsight-gpu-service"
+version = "0.1.0"
+description = "Cellplus 열화상 raw → °C 변환 마이크로서비스 (linux_x86_64 libtemperature_calculator.so 호출)"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.13.0",
+    "fastapi>=0.110",
+    "onnxruntime-gpu>=1.24.3",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "python-multipart>=0.0.29",
+    "rtmlib>=0.0.15",
+    "sentencepiece>=0.2.1",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "transformers>=5.9.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
