@@ -19,6 +19,9 @@ backend/models/*.task
 calibration.npz
 snapshots/
 
+# 보고서 (비공개)
+보고서/
+
 # OS / IDE
 .DS_Store
 .vscode/
