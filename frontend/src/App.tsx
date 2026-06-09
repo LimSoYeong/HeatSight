@@ -164,11 +164,12 @@ interface HvacRecommendation {
 
 interface FaceTemp {
   index: number
+  source?: 'face' | 'pose'
   rgb_bbox: BBox
   thermal_bbox: BBox
   thermal_corners: [number, number][]
-  mean_raw: number
   mean_celsius: number | null
+  region_temps?: Record<string, number>
   sample_count: number
 }
 
@@ -378,6 +379,9 @@ export default function App() {
   }, [])
 
   async function calReset() {
+    if (!window.confirm('현재 캘리브레이션(찍은 점 전부)을 지우고 처음부터 시작할까요?')) {
+      return
+    }
     setCalBusy(true)
     setCalError(null)
     setCalPending(null)
@@ -468,6 +472,8 @@ export default function App() {
         <Dot ok={cal?.homography_ready} label="Calibrated" />
         <button
           className="cal-toggle"
+          disabled={calBusy}
+          // 패널 열기/닫기만 한다(비파괴). 삭제는 패널 안 Reset(확인창)에서만.
           onClick={() => setCalMode((v) => !v)}
         >
           {calMode ? 'Close calibration' : cal?.homography_ready ? 'Recalibrate' : 'Start calibration'}
@@ -488,7 +494,7 @@ export default function App() {
             </div>
             <div className="cal-status">
               {cal?.homography_ready ? (
-                <span className="cal-done">✓ Calibration ready — 추가 페어로 정밀도 향상 가능</span>
+                <span className="cal-done">✓ Calibration ready · {cal?.pair_count ?? 0}쌍 적용 중 — 점을 더 찍으면 정밀도↑</span>
               ) : calPending ? (
                 <span className="cal-hint">
                   다음: <strong>Thermal 패널</strong>에서 같은 실세계 지점 클릭
@@ -532,6 +538,8 @@ export default function App() {
           probe={probe}
           thermalFaces={faceThermal?.faces ?? []}
           thermalPersons={thermalPersons?.people ?? []}
+          rgbFaces={face?.faces ?? []}
+          homography={cal?.homography ?? null}
           rgbPeopleCount={Math.max(
             face?.faces.length ?? 0,
             pose?.poses.length ?? 0,
@@ -691,12 +699,28 @@ function RGBPanel({
               <FaceOverlay
                 key={i}
                 face={f}
-                celsius={faceTemps[i]?.mean_celsius ?? null}
+                celsius={
+                  faceTemps.find(
+                    (t) => t.index === i && (t.source ?? 'face') === 'face',
+                  )?.mean_celsius ?? null
+                }
               />
             ))}
-          {calPairs.map((p, i) => (
-            <CalMarker key={i} x={p.rgb.x} y={p.rgb.y} index={i + 1} />
-          ))}
+          {/* 원거리(얼굴 미검출) 사람: 자세로 추정한 머리 박스를 표시 */}
+          {!calMode &&
+            faceTemps
+              .filter((t) => t.source === 'pose')
+              .map((t, i) => (
+                <PoseHeadOverlay
+                  key={`ph${i}`}
+                  box={t.rgb_bbox}
+                  celsius={t.mean_celsius}
+                />
+              ))}
+          {calMode &&
+            calPairs.map((p, i) => (
+              <CalMarker key={i} x={p.rgb.x} y={p.rgb.y} index={i + 1} />
+            ))}
           {calMode && calPending && (
             <CalPending x={calPending.x} y={calPending.y} index={calPairs.length + 1} />
           )}
@@ -1191,12 +1215,92 @@ function quadOrBbox(quad: Pt[] | undefined, box: BBox): Pt[] {
   return quad && quad.length === 4 ? quad : bboxToQuad(box)
 }
 
+// RGB 픽셀 좌표 → Thermal 픽셀 좌표 (호모그래피 H 적용).
+// 백엔드 calibration.map_bbox 와 동일한 perspective 변환.
+function mapPt(H: number[][], p: Pt): Pt {
+  const w = H[2][0] * p.x + H[2][1] * p.y + H[2][2] || 1e-9
+  return {
+    x: (H[0][0] * p.x + H[0][1] * p.y + H[0][2]) / w,
+    y: (H[1][0] * p.x + H[1][1] * p.y + H[1][2]) / w,
+  }
+}
+
+function mapQuadPts(H: number[][], pts: Pt[]): Pt[] {
+  return pts.map((p) => mapPt(H, p))
+}
+
+// 원거리(얼굴 미검출) 사람 — 자세로 추정한 머리 박스. 얼굴(초록 실선)과 구분되도록
+// 보라색 점선으로 그린다. RGB 패널용(축 정렬 박스).
+function PoseHeadOverlay({ box, celsius }: { box: BBox; celsius: number | null }) {
+  const tempLabel = celsius != null ? `${celsius.toFixed(1)} °C` : null
+  return (
+    <g>
+      <rect
+        x={box.x}
+        y={box.y}
+        width={box.w}
+        height={box.h}
+        fill="rgba(179, 146, 240, 0.08)"
+        stroke="#b392f0"
+        strokeWidth={2}
+        strokeDasharray="6 3"
+        rx={4}
+      />
+      <text
+        x={box.x + 4}
+        y={Math.max(12, box.y - 5)}
+        fill="#b392f0"
+        fontSize={12}
+        fontWeight={600}
+      >
+        {tempLabel ? `head · ${tempLabel}` : 'head (원거리)'}
+      </text>
+    </g>
+  )
+}
+
+// 원거리 사람 — Thermal 패널용. 백엔드가 H로 매핑해 준 thermal_corners 폴리곤.
+function PoseHeadThermalOverlay({
+  corners,
+  celsius,
+}: {
+  corners: [number, number][]
+  celsius: number | null
+}) {
+  if (!corners || corners.length < 3) return null
+  const pts = corners.map(([x, y]) => `${x},${y}`).join(' ')
+  const top = corners.reduce((a, c) => (c[1] < a[1] ? c : a), corners[0])
+  const tempLabel = celsius != null ? `${celsius.toFixed(1)} °C` : null
+  return (
+    <g>
+      <polygon
+        points={pts}
+        fill="rgba(179, 146, 240, 0.08)"
+        stroke="#b392f0"
+        strokeWidth={2}
+        strokeDasharray="6 3"
+      />
+      <text
+        x={top[0]}
+        y={Math.max(12, top[1] - 6)}
+        fill="#b392f0"
+        fontSize={12}
+        fontWeight={600}
+      >
+        {tempLabel ? `head · ${tempLabel}` : 'head (원거리)'}
+      </text>
+    </g>
+  )
+}
+
 function ThermalPanel({
   src,
   minmax,
   probe,
   thermalFaces,
   thermalPersons,
+  rgbFaces,
+  homography,
   rgbPeopleCount,
   faceTemps,
   calPairs,
@@ -1211,6 +1315,8 @@ function ThermalPanel({
   probe: Probe | null
   thermalFaces: FaceRegions[]
   thermalPersons: ThermalPerson[]
+  rgbFaces: FaceRegions[]
+  homography: number[][] | null
   rgbPeopleCount: number
   faceTemps: FaceTemp[]
   calPairs: CalPair[]
@@ -1268,34 +1374,68 @@ function ThermalPanel({
             <Marker x={probe.x} y={probe.y} color="#e6edf3"
                     label={fmtCelsius(probe.celsius) ?? `raw ${probe.raw}`} />
           )}
-          {/* RGB 사람 수를 ground truth로 사용. thermal에서도 그 수만큼만 표시.
-              face 잡힌 사람 우선, 남은 slot은 area 큰 person 박스로 채움. */}
-          {!calMode && (() => {
-            const limit = Math.max(rgbPeopleCount, thermalFaces.length)
-            const faceSlots = Math.min(thermalFaces.length, limit)
-            const visibleFaces = thermalFaces.slice(0, faceSlots)
-            const remainSlots = Math.max(0, limit - visibleFaces.length)
-            const personsSorted = thermalPersons
-              .filter((p) => !visibleFaces.some((f) => boxesOverlap(f.bbox, p.head)))
-              .slice()
-              .sort((a, b) => b.area - a.area)
-              .slice(0, remainSlots)
-            return (
-              <>
-                {visibleFaces.map((f, i) => {
-                  const celsius =
-                    faceTemps.find((t) => t.index === i)?.mean_celsius ?? null
-                  return <FaceOverlay key={`f${i}`} face={f} celsius={celsius} />
-                })}
-                {personsSorted.map((p) => (
-                  <ThermalPersonOverlay key={`p${p.id}`} person={p} />
-                ))}
-              </>
-            )
-          })()}
-          {calPairs.map((p, i) => (
-            <CalMarker key={i} x={p.thermal.x} y={p.thermal.y} index={i + 1} />
-          ))}
+          {/* 캘리브레이션되면 RGB 검출(더 정확)을 H로 thermal에 투영해 그린다 —
+              온도를 재는 영역과 화면 박스가 정확히 일치. 캘리 전엔 thermal 자체검출로 폴백. */}
+          {!calMode && homography && rgbFaces.length > 0
+            ? rgbFaces.map((f, i) => {
+                const H = homography
+                const celsius =
+                  faceTemps.find(
+                    (t) => t.index === i && (t.source ?? 'face') === 'face',
+                  )?.mean_celsius ?? null
+                return (
+                  <FaceThermalQuadOverlay
+                    key={`mf${i}`}
+                    quad={mapQuadPts(H, bboxToQuad(f.bbox))}
+                    forehead={mapQuadPts(H, quadOrBbox(f.forehead_quad, f.forehead_box))}
+                    cheekL={mapQuadPts(H, quadOrBbox(f.cheek_left_quad, f.cheek_left_box))}
+                    cheekR={mapQuadPts(H, quadOrBbox(f.cheek_right_quad, f.cheek_right_box))}
+                    celsius={celsius}
+                  />
+                )
+              })
+            : !calMode &&
+              (() => {
+                // 폴백: 캘리브레이션 전 — RGB 사람 수를 상한으로 thermal 자체검출 표시.
+                const limit = Math.max(rgbPeopleCount, thermalFaces.length)
+                const faceSlots = Math.min(thermalFaces.length, limit)
+                const visibleFaces = thermalFaces.slice(0, faceSlots)
+                const remainSlots = Math.max(0, limit - visibleFaces.length)
+                const personsSorted = thermalPersons
+                  .filter((p) => !visibleFaces.some((f) => boxesOverlap(f.bbox, p.head)))
+                  .slice()
+                  .sort((a, b) => b.area - a.area)
+                  .slice(0, remainSlots)
+                return (
+                  <>
+                    {visibleFaces.map((f, i) => {
+                      const celsius =
+                        faceTemps.find(
+                    (t) => t.index === i && (t.source ?? 'face') === 'face',
+                  )?.mean_celsius ?? null
+                      return <FaceOverlay key={`f${i}`} face={f} celsius={celsius} />
+                    })}
+                    {personsSorted.map((p) => (
+                      <ThermalPersonOverlay key={`p${p.id}`} person={p} />
+                    ))}
+                  </>
+                )
+              })()}
+          {/* 원거리(얼굴 미검출) 사람: 백엔드가 H로 매핑한 머리 영역(thermal_corners) 표시 */}
+          {!calMode &&
+            faceTemps
+              .filter((t) => t.source === 'pose')
+              .map((t, i) => (
+                <PoseHeadThermalOverlay
+                  key={`pht${i}`}
+                  corners={t.thermal_corners}
+                  celsius={t.mean_celsius}
+                />
+              ))}
+          {calMode &&
+            calPairs.map((p, i) => (
+              <CalMarker key={i} x={p.thermal.x} y={p.thermal.y} index={i + 1} />
+            ))}
         </svg>
       </div>
     </div>

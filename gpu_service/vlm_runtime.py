@@ -11,11 +11,15 @@ from transformers import Qwen2VLForConditionalGeneration as _Qwen2VL, AutoProces
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
 DEFAULT_PROMPT = (
-    "Look at the person in this image. Are they showing signs of feeling hot, "
-    "cold, or comfortable? Consider their clothing, posture, hand gestures "
-    "(fanning, hugging arms, holding a blanket, etc.). "
-    "First word of your answer must be exactly one of: hot, cold, neutral. "
-    "Then in 5 words explain why."
+    "You are assessing one person's thermal comfort from this image. "
+    "Decide whether they feel HOT, COLD, or NEUTRAL using visible cues:\n"
+    "- clothing insulation: bare arms / short sleeves (light) vs jacket, "
+    "long sleeves, blanket (heavy);\n"
+    "- posture: hugging arms or hunched shoulders = cold, relaxed and open = neutral;\n"
+    "- gestures: fanning, wiping sweat, rolling up sleeves = hot; "
+    "shivering, rubbing hands = cold.\n"
+    "The first word of your answer must be exactly one of: hot, cold, neutral. "
+    "Then give a brief reason in under 6 words."
 )
 
 

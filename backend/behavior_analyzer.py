@@ -53,6 +53,13 @@ CLIP_QUERIES_COLD = [
     "a person hunched and shivering",
     "a person wrapped in a blanket",
 ]
+# 중립 앵커 — SigLIP sigmoid는 query별 절대값이라, 중립 기준선을 같이 측정해
+# 상대 비교(contrastive)하면 조명·인물에 덜 흔들린다.
+CLIP_QUERIES_NEUTRAL = [
+    "a person sitting comfortably and relaxed",
+    "a person working calmly at a desk",
+    "a person in a neutral resting posture",
+]
 
 
 class BehaviorAnalyzer:
@@ -137,7 +144,7 @@ class BehaviorAnalyzer:
 
     def _run_clip(self) -> None:
         interval = 1.0 / self.CLIP_HZ
-        queries = CLIP_QUERIES_HOT + CLIP_QUERIES_COLD
+        queries = CLIP_QUERIES_HOT + CLIP_QUERIES_COLD + CLIP_QUERIES_NEUTRAL
         import json as _json
         while not self._stop.is_set():
             jpeg = self._grab_jpeg()
@@ -199,19 +206,32 @@ class BehaviorAnalyzer:
 
     @staticmethod
     def _fuse(heur: str, clip_scores: Dict[str, float], vlm: Optional[str]) -> str:
-        """heuristic + clip + vlm을 가중합해서 최종 comfort 결정. 가중치 합 1.0."""
+        """heuristic + clip + vlm을 가중합해서 최종 comfort 결정. 가중치 합 1.0.
+
+        CLIP은 query별 절대 sigmoid 대신 카테고리 평균을 중립 앵커와 비교한
+        상대값(contrastive)을 쓴다 — 조명·인물 편차에 덜 흔들린다.
+        """
         W_H, W_C, W_V = BehaviorAnalyzer.W_HEUR, BehaviorAnalyzer.W_CLIP, BehaviorAnalyzer.W_VLM
         hot = 0.0
         cold = 0.0
-        if heur == "hot": hot += W_H
-        if heur == "cold": cold += W_H
+        if heur == "hot":
+            hot += W_H
+        elif heur == "cold":
+            cold += W_H
         if clip_scores:
-            for q in CLIP_QUERIES_HOT:
-                hot += clip_scores.get(q, 0.0) * W_C
-            for q in CLIP_QUERIES_COLD:
-                cold += clip_scores.get(q, 0.0) * W_C
-        if vlm == "hot": hot += W_V
-        elif vlm == "cold": cold += W_V
+            def cat_mean(qs):
+                vals = [clip_scores.get(q, 0.0) for q in qs]
+                return sum(vals) / len(vals) if vals else 0.0
+            ch = cat_mean(CLIP_QUERIES_HOT)
+            cc = cat_mean(CLIP_QUERIES_COLD)
+            cn = cat_mean(CLIP_QUERIES_NEUTRAL)
+            # 중립 대비 초과분만 신호로. gain 2.5로 스케일 후 [0, W_C]로 클램프.
+            hot += min(W_C, max(0.0, (ch - cn)) * 2.5)
+            cold += min(W_C, max(0.0, (cc - cn)) * 2.5)
+        if vlm == "hot":
+            hot += W_V
+        elif vlm == "cold":
+            cold += W_V
         # 임계 0.45 — 어느 축도 단독으로는 결정 못 하고 최소 두 축 합의가 필요한 설계
         if hot > 0.45 and hot > cold + 0.1:
             return "hot"

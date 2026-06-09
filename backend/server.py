@@ -51,6 +51,10 @@ from calibration import Calibration
 
 GPU_SERVICE_URL = "http://101.79.21.220:9000"
 
+# MJPEG 스트림 출력 fps 상한. 소스(특히 RGB)가 동일 프레임을 수백 fps로
+# 폭주시켜도 브라우저로 나가는 프레임 수를 제한해 디코딩 정체(화면 멈춤)를 막는다.
+MJPEG_MAX_FPS = 25.0
+
 
 app = FastAPI(title="HeatSight Backend")
 app.add_middleware(
@@ -231,13 +235,49 @@ def _gpu_convert_celsius(raw: int, dyn: dict) -> Optional[float]:
 SKIN_TARGET_C = 34.0
 SKIN_NEUTRAL_BAND_C = 1.8
 
+# 얼굴 부위별 피부온도 가중치. 적외선 열화상 쾌적도 연구(Cheng 등)에 따르면
+# 뺨·코가 열적 진폭이 커 쾌적도 예측력이 가장 높고(특히 오른뺨), 이마는
+# 환경·머리카락 노이즈가 커 신뢰도가 낮다. 합 1.0.
+FACE_REGION_WEIGHTS = {
+    "cheek_r": 0.30,
+    "cheek_l": 0.28,
+    "nose": 0.24,
+    "forehead": 0.18,
+}
+
+# 다인 집계 시 불편한 사람에 가중하는 정도. weight = 1 + ALPHA·score^2 형태로
+# (PMV 불만족률 PPD가 PMV^2에 비례) 가장 불편한 재실자를 더 보호한다.
+DISCOMFORT_ALPHA = 2.0
+
+# 그룹 쾌적도 점수의 시간축 EMA 평활 계수(절대 피부온도 측정 노이즈 완화).
+COMFORT_EMA_ALPHA = 0.4
+_comfort_ema: dict = {"value": None}
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-def _measure_face_temperature_results(grid: int = 4) -> dict:
-    """검출된 face bbox를 thermal 좌표로 매핑해 평균 피부 온도를 측정."""
+def _bbox_overlap(a: dict, b: dict) -> bool:
+    """두 bbox(dict: x,y,w,h)가 한 픽셀이라도 겹치면 True."""
+    return not (
+        a["x"] + a["w"] <= b["x"]
+        or b["x"] + b["w"] <= a["x"]
+        or a["y"] + a["h"] <= b["y"]
+        or b["y"] + b["h"] <= a["y"]
+    )
+
+
+def _measure_face_temperature_results(
+    grid: int = 4,
+    face_latest: Optional[dict] = None,
+    pose_latest: Optional[dict] = None,
+) -> dict:
+    """검출된 머리 영역을 thermal 좌표로 매핑해 평균 피부 온도를 측정.
+
+    얼굴(MediaPipe, source="face")이 우선. 원거리 등으로 얼굴을 못 잡은 사람은
+    자세 키포인트로 추정한 머리 박스(source="pose")로 보완한다.
+    """
     if hub.face is None:
         raise HTTPException(status_code=503, detail="FaceAnalyzer 비활성")
     if hub.cellplus is None:
@@ -245,8 +285,13 @@ def _measure_face_temperature_results(grid: int = 4) -> dict:
     if calibration.H is None:
         raise HTTPException(status_code=400, detail="캘리브레이션 필요 (4쌍 이상)")
 
-    face_latest = hub.face.latest()
+    if face_latest is None:
+        face_latest = hub.face.latest()
+    if pose_latest is None:
+        pose_latest = hub.pose.latest() if hub.pose is not None else {"poses": []}
     faces = face_latest.get("faces", [])
+    poses = pose_latest.get("poses", [])
+    face_bboxes = [f["bbox"] for f in faces]
 
     results: list[dict] = []
     with hub.serial_lock:
@@ -255,33 +300,111 @@ def _measure_face_temperature_results(grid: int = 4) -> dict:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"dynamic params 읽기 실패: {e}")
 
-        for idx, f in enumerate(faces):
-            rgb_bbox = f["bbox"]
-            mapped = calibration.map_bbox(
-                rgb_bbox["x"], rgb_bbox["y"], rgb_bbox["w"], rgb_bbox["h"]
-            )
+        # 부위별 측정은 작은 grid로 — 부위 4개라도 전체 샘플 수를 통제한다.
+        region_grid = min(grid, 2)
+
+        def measure_box(box: Optional[dict], g: int) -> Optional[tuple[float, int]]:
+            """단일 RGB 박스를 thermal로 매핑·측정 → (섭씨, 샘플수). 실패 시 None."""
+            if not box:
+                return None
+            mapped = calibration.map_bbox(box["x"], box["y"], box["w"], box["h"])
             if mapped is None:
-                continue
+                return None
             tbb = mapped["bbox"]
             try:
                 mean_raw, samples = hub.cellplus.measure_bbox_mean_raw(
-                    tbb["x"], tbb["y"], tbb["w"], tbb["h"], grid=grid
+                    tbb["x"], tbb["y"], tbb["w"], tbb["h"], grid=g
                 )
             except ValueError:
-                continue
+                return None
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"thermal 측정 실패: {e}")
+            return _gpu_convert_celsius(mean_raw, dyn), len(samples)
 
-            mean_celsius = _gpu_convert_celsius(mean_raw, dyn)
+        def measure_face(f: dict, index: int) -> None:
+            """얼굴 — 부위별(뺨·코·이마) 측정 후 신뢰도 가중 평균."""
+            rgb_bbox = f["bbox"]
+            whole = calibration.map_bbox(
+                rgb_bbox["x"], rgb_bbox["y"], rgb_bbox["w"], rgb_bbox["h"]
+            )
+            if whole is None:
+                return
+            nose = f.get("nose_tip")
+            ns = max(8, int(rgb_bbox["w"] * 0.12))
+            nose_box = (
+                {"x": int(nose["x"] - ns / 2), "y": int(nose["y"] - ns / 2),
+                 "w": ns, "h": ns}
+                if nose else None
+            )
+            region_boxes = {
+                "cheek_r": f.get("cheek_right_box"),
+                "cheek_l": f.get("cheek_left_box"),
+                "nose": nose_box,
+                "forehead": f.get("forehead_box"),
+            }
+            region_temps: dict = {}
+            tsum = wsum = 0.0
+            samp = 0
+            for name, box in region_boxes.items():
+                r = measure_box(box, region_grid)
+                if r is None:
+                    continue
+                c, n = r
+                region_temps[name] = round(c, 2)
+                w = FACE_REGION_WEIGHTS[name]
+                tsum += c * w
+                wsum += w
+                samp += n
+            if wsum > 0:
+                mean_celsius = tsum / wsum
+            else:
+                # 부위 측정이 모두 실패하면 얼굴 전체 박스로 폴백
+                r = measure_box(rgb_bbox, grid)
+                if r is None:
+                    return
+                mean_celsius, samp = r
             results.append({
-                "index": idx,
+                "index": index,
+                "source": "face",
                 "rgb_bbox": rgb_bbox,
-                "thermal_bbox": tbb,
-                "thermal_corners": mapped["corners"],
-                "mean_raw": mean_raw,
+                "thermal_bbox": whole["bbox"],
+                "thermal_corners": whole["corners"],
                 "mean_celsius": mean_celsius,
-                "sample_count": len(samples),
+                "region_temps": region_temps,
+                "sample_count": samp,
             })
+
+        def measure_head(hb: dict, index: int) -> None:
+            """원거리 머리 박스 — 부위 구분 없이 전체 평균."""
+            mapped = calibration.map_bbox(hb["x"], hb["y"], hb["w"], hb["h"])
+            if mapped is None:
+                return
+            r = measure_box(hb, grid)
+            if r is None:
+                return
+            mean_celsius, samp = r
+            results.append({
+                "index": index,
+                "source": "pose",
+                "rgb_bbox": hb,
+                "thermal_bbox": mapped["bbox"],
+                "thermal_corners": mapped["corners"],
+                "mean_celsius": mean_celsius,
+                "region_temps": {},
+                "sample_count": samp,
+            })
+
+        for idx, f in enumerate(faces):
+            measure_face(f, idx)
+
+        # 얼굴 미검출 보완: 어떤 face 와도 안 겹치는 pose 머리 박스
+        for pidx, pse in enumerate(poses):
+            hb = pse.get("head_box")
+            if not hb:
+                continue
+            if any(_bbox_overlap(hb, fb) for fb in face_bboxes):
+                continue
+            measure_head(hb, pidx)
 
     return {
         "timestamp": face_latest.get("timestamp", 0.0),
@@ -325,11 +448,31 @@ def _skin_score(skin_celsius: Optional[float]) -> Optional[float]:
     return _clamp((skin_celsius - SKIN_TARGET_C) / SKIN_NEUTRAL_BAND_C, -1.0, 1.0)
 
 
-def _occupant_details(face_latest: dict, face_temps: list[dict]) -> list[dict]:
-    temp_by_index = {int(f["index"]): f for f in face_temps}
+def _aggregate_discomfort(scores: list) -> Optional[float]:
+    """사람별 쾌적도 점수[-1,1]를 불편 가중 평균으로 집계.
+
+    weight = 1 + DISCOMFORT_ALPHA·score^2 (불만족률 PPD가 PMV^2에 비례한다는 점에서
+    착안). 가장 불편한 재실자의 영향을 키워, 단순 평균이 소수의 강한 불만을
+    희석시키는 문제를 완화한다. 빈 리스트면 None.
+    """
+    if not scores:
+        return None
+    num = den = 0.0
+    for s in scores:
+        w = 1.0 + DISCOMFORT_ALPHA * s * s
+        num += w * s
+        den += w
+    return num / den if den else None
+
+
+def _occupant_details(detected: list, temp_results: list[dict]) -> list[dict]:
+    """detected: (source, index, rgb_bbox) 목록. temp_results와 (source,index)로 매칭."""
+    temp_by_key = {
+        (t.get("source", "face"), int(t["index"])): t for t in temp_results
+    }
     details: list[dict] = []
-    for idx, face in enumerate(face_latest.get("faces", [])):
-        temp = temp_by_index.get(idx)
+    for n, (source, index, rgb_bbox) in enumerate(detected):
+        temp = temp_by_key.get((source, index))
         skin_c = (
             float(temp["mean_celsius"])
             if temp is not None and temp.get("mean_celsius") is not None
@@ -337,13 +480,14 @@ def _occupant_details(face_latest: dict, face_temps: list[dict]) -> list[dict]:
         )
         score = _skin_score(skin_c)
         details.append({
-            "id": f"person-{idx + 1}",
-            "index": idx,
-            "label": f"Person {idx + 1}",
+            "id": f"person-{n + 1}",
+            "index": n,
+            "label": f"Person {n + 1}" + (" (원거리)" if source == "pose" else ""),
+            "source": source,
             "comfort": _comfort_from_score(score) if score is not None else "unknown",
             "comfort_score": round(score, 3) if score is not None else None,
             "skin_temperature_c": skin_c,
-            "rgb_bbox": face.get("bbox"),
+            "rgb_bbox": rgb_bbox,
             "thermal_bbox": temp.get("thermal_bbox") if temp is not None else None,
             "sample_count": temp.get("sample_count", 0) if temp is not None else 0,
         })
@@ -440,6 +584,8 @@ def _mjpeg_iterator(source_name: str) -> AsyncIterator[bytes]:
     """무한 MJPEG 스트림 생성기. 클라이언트 disconnect 시 자연 종료."""
     boundary = b"--frame"
     last_ts = -1.0
+    min_interval = 1.0 / MJPEG_MAX_FPS  # 출력 fps 상한 간격
+    last_emit = 0.0
 
     def encode(frame: np.ndarray) -> bytes:
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -456,10 +602,13 @@ def _mjpeg_iterator(source_name: str) -> AsyncIterator[bytes]:
         except Exception:
             time.sleep(0.05)
             continue
-        if frame.timestamp == last_ts:
-            time.sleep(0.005)
+        now = time.monotonic()
+        # 같은 프레임이거나 fps 상한 간격이 안 지났으면 보내지 않는다
+        if frame.timestamp == last_ts or (now - last_emit) < min_interval:
+            time.sleep(0.003)
             continue
         last_ts = frame.timestamp
+        last_emit = now
 
         jpeg = encode(frame.image)
         if not jpeg:
@@ -696,16 +845,27 @@ def hvac_recommendation() -> dict:
     pose_latest = hub.pose.latest() if hub.pose is not None else {"poses": []}
     behavior_latest = hub.behavior.latest() if hub.behavior is not None else None
 
-    face_count = len(face_latest.get("faces", []))
-    pose_count = len(pose_latest.get("poses", []))
-    occupants = face_count if face_count > 0 else min(pose_count, 1)
+    faces = face_latest.get("faces", [])
+    poses = pose_latest.get("poses", [])
+    face_count = len(faces)
+    face_bboxes = [f["bbox"] for f in faces]
+
+    # 검출된 사람 = 얼굴(정밀) + 얼굴과 안 겹치는 pose 머리 박스(원거리 보완)
+    detected: list = [("face", i, f["bbox"]) for i, f in enumerate(faces)]
+    for pidx, pse in enumerate(poses):
+        hb = pse.get("head_box")
+        if hb and not any(_bbox_overlap(hb, fb) for fb in face_bboxes):
+            detected.append(("pose", pidx, hb))
+    occupants = len(detected)
 
     face_temps: list[dict] = []
     thermal_error = None
-    if face_count > 0 and hub.cellplus is not None and calibration.H is not None:
+    if occupants > 0 and hub.cellplus is not None and calibration.H is not None:
         try:
             # 제어용은 빠른 반응이 우선이므로 2x2 샘플로 계산한다.
-            face_temps = _measure_face_temperature_results(grid=2).get("faces", [])
+            face_temps = _measure_face_temperature_results(
+                grid=2, face_latest=face_latest, pose_latest=pose_latest
+            ).get("faces", [])
         except HTTPException as e:
             thermal_error = str(e.detail)
 
@@ -714,30 +874,35 @@ def hvac_recommendation() -> dict:
         for f in face_temps
         if f.get("mean_celsius") is not None
     ]
-    occupant_details = _occupant_details(face_latest, face_temps)
-    if not occupant_details and occupants > 0:
-        occupant_details = [{
-            "id": "person-1",
-            "index": 0,
-            "label": "Person 1",
-            "comfort": "unknown",
-            "comfort_score": None,
-            "skin_temperature_c": None,
-            "rgb_bbox": None,
-            "thermal_bbox": None,
-            "sample_count": 0,
-        }]
+    occupant_details = _occupant_details(detected, face_temps)
     skin_avg = sum(skin_values) / len(skin_values) if skin_values else None
-    thermal_score = _skin_score(skin_avg)
+
+    # 사람별 쾌적도 점수 → 불편 가중 집계(단순 평균 대신 가장 불편한 사람을 보호).
+    per_person_scores = [
+        s for s in (_skin_score(v) for v in skin_values) if s is not None
+    ]
+    thermal_score = _aggregate_discomfort(per_person_scores)
     behavior_score = _behavior_score(behavior_latest)
 
+    # 제어를 좌우하는(가장 불편한) 재실자 식별
+    rated = [o for o in occupant_details if o.get("comfort_score") is not None]
+    driving = max(rated, key=lambda o: abs(o["comfort_score"])) if rated else None
+
     if occupants <= 0:
-        comfort_score = 0.0
+        raw_comfort = 0.0
     elif thermal_score is not None:
-        comfort_score = 0.7 * thermal_score + 0.3 * behavior_score
+        raw_comfort = 0.7 * thermal_score + 0.3 * behavior_score
     else:
-        comfort_score = behavior_score
-    comfort_score = round(_clamp(comfort_score, -1.0, 1.0), 3)
+        raw_comfort = behavior_score
+    raw_comfort = _clamp(raw_comfort, -1.0, 1.0)
+
+    # 시간축 EMA 평활 — 절대 피부온도의 프레임별 노이즈로 제어가 떨리는 것을 막는다.
+    prev = _comfort_ema["value"]
+    smoothed = raw_comfort if (prev is None or occupants <= 0) else (
+        COMFORT_EMA_ALPHA * raw_comfort + (1 - COMFORT_EMA_ALPHA) * prev
+    )
+    _comfort_ema["value"] = None if occupants <= 0 else smoothed
+    comfort_score = round(_clamp(smoothed, -1.0, 1.0), 3)
 
     comfort = _comfort_from_score(comfort_score)
     control = _control_from_score(comfort_score, occupants)
@@ -758,12 +923,15 @@ def hvac_recommendation() -> dict:
         "occupant_details": occupant_details,
         "comfort": comfort,
         "comfort_score": comfort_score,
+        "driving_occupant": driving["id"] if driving else None,
         "skin_temperature_c": skin_avg,
         "skin_temperatures_c": skin_values,
         "control": control,
         "energy": energy,
         "signals": {
-            "thermal_score": thermal_score,
+            "thermal_score": round(thermal_score, 3) if thermal_score is not None else None,
+            "comfort_score_raw": round(raw_comfort, 3),
+            "aggregation": "discomfort_weighted",
             "behavior_score": round(behavior_score, 3),
             "behavior_comfort": (
                 behavior_latest.get("fused_comfort") or behavior_latest.get("comfort")

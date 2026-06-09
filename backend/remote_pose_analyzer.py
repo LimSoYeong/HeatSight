@@ -21,6 +21,10 @@ import numpy as np
 
 # COCO 17 keypoints — RTMLib Body 모델 출력 순서
 COCO_NOSE       = 0
+COCO_EYE_L      = 1
+COCO_EYE_R      = 2
+COCO_EAR_L      = 3
+COCO_EAR_R      = 4
 COCO_SHOULDER_L = 5
 COCO_SHOULDER_R = 6
 COCO_ELBOW_L    = 7
@@ -61,6 +65,8 @@ class PoseRegions:
     hand_l_box: Optional[BBox]
     hand_r_box: Optional[BBox]
     torso_box: Optional[BBox]
+    # 얼굴 검출 실패(원거리) 시 보완용: 코/눈/귀 키포인트로 추정한 머리 박스
+    head_box: Optional[BBox]
 
 
 @dataclass
@@ -171,6 +177,39 @@ class RemotePoseAnalyzer:
             wrist_r    = pt(COCO_WRIST_R)
             hip_l      = pt(COCO_HIP_L)
             hip_r      = pt(COCO_HIP_R)
+            nose   = pt(COCO_NOSE)
+            eye_l  = pt(COCO_EYE_L)
+            eye_r  = pt(COCO_EYE_R)
+            ear_l  = pt(COCO_EAR_L)
+            ear_r  = pt(COCO_EAR_R)
+
+            def head_box() -> Optional[BBox]:
+                """코/눈/귀 키포인트로 머리 박스 추정. 크기는 귀 간격 우선,
+                없으면 어깨 너비로 보정. 원거리 얼굴 미검출 시 온도 측정 보완용."""
+                head_pts = [nose, eye_l, eye_r, ear_l, ear_r]
+                vis = [p for p in head_pts if p.visible]
+                if not vis:
+                    return None
+                cx = sum(p.x for p in vis) / len(vis)
+                cy = sum(p.y for p in vis) / len(vis)
+                if ear_l.visible and ear_r.visible and abs(ear_r.x - ear_l.x) > 4:
+                    width = abs(ear_r.x - ear_l.x) * 1.5
+                elif shoulder_l.visible and shoulder_r.visible:
+                    width = abs(shoulder_r.x - shoulder_l.x) * 0.45
+                elif len(vis) >= 2:
+                    xs = [p.x for p in vis]
+                    ys = [p.y for p in vis]
+                    width = max(max(xs) - min(xs), max(ys) - min(ys)) * 1.8 + 16
+                else:
+                    return None  # 코 하나만으론 크기 추정 불가
+                width = max(24.0, min(width, 400.0))
+                height = width * 1.4
+                return BBox(
+                    x=int(max(0, cx - width / 2)),
+                    y=int(max(0, cy - height / 2)),
+                    w=int(width),
+                    h=int(height),
+                )
 
             def hand_box(wrist: Pt) -> Optional[BBox]:
                 if not wrist.visible:
@@ -201,5 +240,6 @@ class RemotePoseAnalyzer:
                 hand_l_box=hand_box(wrist_l),
                 hand_r_box=hand_box(wrist_r),
                 torso_box=torso_box,
+                head_box=head_box(),
             ))
         return out
